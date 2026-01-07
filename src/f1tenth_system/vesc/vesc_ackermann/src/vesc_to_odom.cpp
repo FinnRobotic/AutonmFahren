@@ -72,7 +72,7 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
   publish_tf_ = declare_parameter("publish_tf", publish_tf_);
 
   // create odom publisher
-  odom_pub_ = create_publisher<Odometry>("odom", 10);
+  odom_pub_ = create_publisher<Odometry>("/odom_vesc", 10);
 
   // create tf broadcaster
   if (publish_tf_) {
@@ -97,7 +97,7 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   }
 
   // convert to engineering units
-  double current_speed = (-state->state.speed - speed_to_erpm_offset_) / speed_to_erpm_gain_;
+  double current_speed = -(-state->state.speed - speed_to_erpm_offset_) / speed_to_erpm_gain_;
   if (std::fabs(current_speed) < 0.05) {
     current_speed = 0.0;
   }

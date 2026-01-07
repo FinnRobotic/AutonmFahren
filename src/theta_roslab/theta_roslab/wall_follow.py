@@ -183,7 +183,7 @@ def main(args=None):
 
 
     rclpy.spin(node)
-    PubSubNode.destroy_node()
+    node.destroy_node()
     rclpy.shutdown()
 
 

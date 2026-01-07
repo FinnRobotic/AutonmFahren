@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, Joy
 from nav_msgs.msg import Odometry
 from ackermann_msgs.msg import AckermannDriveStamped
 from std_msgs.msg import Float64
@@ -9,7 +9,7 @@ from std_msgs.msg import Float64
 import numpy as np
 import math
 
-TTC_TRESHOLD = 0.5
+TTC_TRESHOLD = 0.65
 
 
 def timte_to_collision(velocity, angle, dist):
@@ -46,6 +46,31 @@ class SafetyNode(Node):
         )
         self.odom_msg = None
 
+
+        self.sub_Joy = self.create_subscription(
+            Joy,
+            '/joy',
+            self.cb_joy,
+            10
+        )
+        
+
+        self.sub_drive = self.create_subscription(
+            AckermannDriveStamped,
+            '/drive',
+            self.cb_drive,
+            10
+        )
+        self.drive = 0.0
+
+        self.sub_teleop = self.create_subscription(
+            AckermannDriveStamped,
+            '/teleop',
+            self.cb_teleop,
+            10
+        )
+        self.teleop = 0.0
+
         self.pub_ttc = self.create_publisher(
             Float64,
             '/ttc',
@@ -63,7 +88,9 @@ class SafetyNode(Node):
 
 
         self.threshold_violated = False
-        self.last_v = None
+        self.violated_time = self.get_clock().now().nanoseconds * 1e-9
+        self.last_v = 0.0
+        self.safety_button_pressed = False
 
 
         self.ttc_timer = self.create_timer(
@@ -76,6 +103,15 @@ class SafetyNode(Node):
             self.pub_cb
         )
 
+
+    def cb_drive(self, msg: AckermannDriveStamped):
+        self.drive = msg.drive.speed
+
+
+    def cb_teleop(self, msg: AckermannDriveStamped):
+        self.teleop = msg.drive.speed#
+
+
     def cb_lidar(self, msg: LaserScan):
         ranges = np.array(msg.ranges)
         self.valid_ranges = ranges[np.isfinite(ranges)]
@@ -84,6 +120,18 @@ class SafetyNode(Node):
     def cb_odom(self, msg: Odometry):
         self.odom_msg = msg
 
+    def cb_joy(self ,msg: Joy):
+        button =msg.buttons[4]
+        if button == 0:
+            msg = AckermannDriveStamped()
+            msg.drive.speed = 0.0
+            self.pub_brake.publish(msg)
+            self.safety_button_pressed = False
+        else:
+            self.safety_button_pressed = True
+
+
+    
 
     def ttc_cb(self):
         if self.odom_msg is None or self.lidar_msg is None:
@@ -93,36 +141,35 @@ class SafetyNode(Node):
         angle = self.lidar_msg.angle_min
         angle_incr = self.lidar_msg.angle_increment
 
-        vx = -self.odom_msg.twist.twist.linear.x
-        vy = -self.odom_msg.twist.twist.linear.y
+        vx = self.odom_msg.twist.twist.linear.x
 
-        if self.threshold_violated:
-            vx = self.last_v[0]
-            vy = self.last_v[1]
+        if self.threshold_violated: # and self.get_clock().now().nanoseconds * 1e-9 - self.violated_time > 0.5:
+            if self.drive != 0.0:
+                print(self.drive)
 
-        v = math.sqrt(vx**2 + vy**2)
+                vx = self.drive
+            elif self.teleop != 0.0:
+                print(self.teleop)
 
+                vx = self.teleop
+            else:
+                vx = self.last_v
 
-        if abs(v) == 0:
-            normed_vx = 0
-            normed_vy = 0
-        else:
-            normed_vx = vx / v
-            normed_vy = vy / v
-
-        theta_v = math.atan2(normed_vy, normed_vx)
 
         ttc_min = 10000000.0
 
 
         for range in self.valid_ranges:
 
-            ttc = timte_to_collision(v, theta_v - angle, range)
+            ttc = timte_to_collision(vx, angle, range)
             if ttc < TTC_TRESHOLD:
+                if self.threshold_violated:
+                    self.violated_time = self.get_clock().now().nanoseconds * 1e-9  
+                    self.last_v = vx
+
                 self.threshold_violated = True
                 ttc_msg = Float64()
                 ttc_msg.data = ttc
-                self.last_v = np.array([vx, vy])
                 self.pub_ttc.publish(ttc_msg)
                 return
             elif ttc < ttc_min:
@@ -140,8 +187,7 @@ class SafetyNode(Node):
 
 
     def pub_cb(self):
-        print(self.threshold_violated)
-        if self.threshold_violated:
+        if self.threshold_violated or self.safety_button_pressed is False:
             msg = AckermannDriveStamped()
             msg.drive.speed = 0.0
             self.pub_brake.publish(msg)

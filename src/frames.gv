@@ -1,0 +1,11 @@
+digraph G {
+"world" -> "Praktikum25_car3"[label=" Broadcaster: default_authority\nAverage rate: 120.197\nBuffer length: 5.042\nMost recent transform: 1764761845.122604\nOldest transform: 1764761840.080875\n"];
+"world" -> "Praktikum25_car4"[label=" Broadcaster: default_authority\nAverage rate: 120.197\nBuffer length: 5.042\nMost recent transform: 1764761845.122655\nOldest transform: 1764761840.080939\n"];
+"world" -> "base_link"[label=" Broadcaster: default_authority\nAverage rate: 10.2\nBuffer length: 5.0\nMost recent transform: 1764761845.106658\nOldest transform: 1764761840.106879\n"];
+"world" -> "map"[label=" Broadcaster: default_authority\nAverage rate: 510000.0\nBuffer length: 0.0\nMost recent transform: 1764761131.310688\nOldest transform: 1764761131.310688\n"];
+"base_link" -> "laser"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+edge [style=invis];
+ subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
+"Recorded at time: 1764761845.1390913"[ shape=plaintext ] ;
+}->"world";
+}

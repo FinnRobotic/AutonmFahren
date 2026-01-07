@@ -14,6 +14,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
+        (os.path.join('share', package_name, 'waypoints'), glob('waypoints/*.csv')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -22,6 +23,14 @@ setup(
     description='Simple lidar node',
     license='MIT',
     tests_require=['pytest'],
+
+
+
+    package_data={
+    'theta_roslab': ['waypoints/*.csv'],    
+    },
+    include_package_data=True,
+
     entry_points={
         'console_scripts': [
             'lidar_example_node=theta_roslab.LidarExampleNode:main',
@@ -29,7 +38,10 @@ setup(
             'keyboard_control_talker=theta_roslab.KeyboardControlTalker:main',
             'key_listener=theta_roslab.keyListener:main',   
             'safety_node=theta_roslab.SafetyNode:main',
-            'wall_follow_node=theta_roslab.wall_follow:main'
+            'wall_follow_node=theta_roslab.wall_follow:main',
+            'pure_pursuit_node=theta_roslab.pure_pursuit:main',
+            'vicon_to_odom=theta_roslab.vicon_to_odom:main',
+            'vicon_to_odom_2=theta_roslab.vicon_to_odom2:main',
         ],
     },
 )
