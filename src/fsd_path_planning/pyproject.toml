@@ -1,0 +1,37 @@
+[project]
+name = "fsd_path_planning"
+version = "0.4.3.2"
+readme = "README.md"
+dependencies = [
+    "icecream",
+    "numba",
+    "numpy>=1.21,<1.25",
+    "scipy",
+    "typing_extensions",
+    "scikit-learn",
+]
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "mypy",
+    "pylint",
+]
+demo = [
+    "matplotlib",
+    "notebook",
+    "plotly",
+    "streamlit",
+    "tqdm",
+    "typer",
+]
+
+[tool.setuptools]
+packages = {find = {}}
+include-package-data = true
+
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"

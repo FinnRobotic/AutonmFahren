@@ -1,0 +1,48 @@
+pure_pursuit_controller:
+  ros__parameters:
+
+    # --- Topics ---
+    vehicle_state_topic: "/slam/vehicle_state"
+    path_topic: "/trajectory/middle_line"          # expects as_msgs/PathWithCurvature
+    cmd_topic: "/controller/actuator_request"
+
+    # --- Simulator / FSDS toggle ---
+    fsds: false
+
+    # --- Bicycle Model & (baseline) lookahead ---
+    wheelbase: 2.5          # [m]
+    lookahead: 3.0          # [m] used when dynamic driving is NOT allowed
+
+    # --- Dynamic lookahead (active only when dynamic_driving_allowed == true) ---
+    Ld_base: 2.0            # [m]  Ld = clamp(Ld_base + Ld_gain * v, Ld_min, Ld_max)
+    Ld_gain: 0.3            # [m/(m/s)]
+    Ld_min: 1.5             # [m]
+    Ld_max: 10.0            # [m]
+
+    # --- Lateral controller (PP + PID) ---
+    kp_steer: 0.0
+    ki_steer: 0.0
+    kd_steer: 0.0
+    kp_psi_steer: 0.2
+    steer_int_limit: 2.0        # |∫e_y| limit
+    pid_clip_deg: 10.0          # clamp for delta_pid [deg]
+    steer_limit_deg: 30.0       # physical steering limit [deg]
+    alpha: 0.5                  # steering smoothing 0..1
+
+    # --- Longitudinal (speed PID, baseline) ---
+    v_ref: 5.0                  # [m/s] used when dynamic driving is NOT allowed
+    kp_speed: 4.0
+    ki_speed: 1.0
+    kd_speed: 0.0
+    speed_int_limit: 2.0        # |∫v_err| limit
+    torque_limit: 100.0         # [Nm]
+
+    # --- Curvature-based speed (active only when dynamic_driving_allowed == true) ---
+    use_curvature_speed: true   # enable v_ref from curvature at lookahead
+    a_lat_max: 3.0              # [m/s^2] lateral accel cap
+    v_ref_min: 1.0              # [m/s]
+    v_ref_max: 15.0             # [m/s]
+    v_ref_smoothing_alpha: 0.7  # 0..1, exponential smoothing of v_ref
+
+    # --- Misc ---
+    min_path_size: 5
