@@ -1,0 +1,142 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+  - Class: rviz_common/Views
+    Name: Views
+  - Class: rviz_common/Time
+    Name: Time
+
+Visualization Manager:
+  Class: ""
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+    Frame Rate: 30
+
+  Displays:
+    # =========================
+    # RAW MAP (normal)
+    # =========================
+    - Class: rviz_default_plugins/Map
+      Enabled: true
+      Name: Map Raw (/map_raw)
+      Topic: /map_raw
+      Alpha: 0.65
+      Draw Behind: true
+      Color Scheme: map
+
+    # =========================
+    # Track Mask
+    # =========================
+    - Class: rviz_default_plugins/Map
+      Enabled: false
+      Name: Track Mask (/map_track_mask)
+      Topic: /map_track_mask
+      Alpha: 0.85
+      Draw Behind: false
+      Color Scheme: map
+
+    # =========================
+    # Track Clean
+    # =========================
+    - Class: rviz_default_plugins/Map
+      Enabled: true
+      Name: Track Clean (/map_track_clean)
+      Topic: /map_track_clean
+      Alpha: 0.75
+      Draw Behind: false
+      Color Scheme: map
+
+    # =========================
+    # Skeleton
+    # =========================
+    - Class: rviz_default_plugins/Map
+      Enabled: true
+      Name: Skeleton (/map_skeleton)
+      Topic: /map_skeleton
+      Alpha: 1.0
+      Draw Behind: false
+      Color Scheme: map
+
+    # =========================
+    # Graph MarkerArray
+    # =========================
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Track Graph Markers
+      Topic: /track_graph_markers
+      Queue Size: 10
+
+    # =========================
+    # Centerline Path
+    # =========================
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Centerline Path
+      Topic: /track_centerline_path
+      Queue Size: 10
+      Line Style: Lines
+      Line Width: 0.05
+      Color: 255; 255; 0
+      Alpha: 1.0
+      Buffer Length: 1
+
+    # Optional: TF anzeigen
+    - Class: rviz_default_plugins/TF
+      Enabled: false
+      Name: TF
+      Frame Timeout: 15
+
+    # Optional: Grid
+    - Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: Grid
+      Cell Size: 1
+      Plane: XY
+      Color: 80; 80; 80
+      Alpha: 0.35
+
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic: /initialpose
+    - Class: rviz_default_plugins/SetGoal
+      Topic: /goal_pose
+
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: TopDownOrtho
+      Angle: 0
+      Scale: 50
+      X: 0
+      Y: 0
+      Near Clip Distance: 0.01
+      Far Clip Distance: 500
+
+Window Geometry:
+  Width: 1400
+  Height: 900
+  X: 100
+  Y: 80
+  Hide Left Dock: false
+  Hide Right Dock: false
+  Displays:
+    collapsed: false
+  Selection:
+    collapsed: false
+  Tool Properties:
+    collapsed: false
+  Views:
+    collapsed: false
+  Time:
+    collapsed: false

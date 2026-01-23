@@ -1,376 +1,767 @@
 #!/usr/bin/env python3
+"""
+ROS2 node: Track centerline from OccupancyGrid map (PGM+YAML)
+Pipeline:
+  OccupancyGrid -> Track mask -> remove outside region -> skeletonize -> prune spurs
+  -> trace closed loop (choose "middle/straight" arm at junctions)
+  -> publish debug maps + centerline markers + Path
+  -> save CSV with x,y,yaw,curvature,s
+
+Topics:
+  /map_raw          nav_msgs/OccupancyGrid
+  /map_track_mask   nav_msgs/OccupancyGrid
+  /map_skeleton     nav_msgs/OccupancyGrid
+  /track_graph_markers   visualization_msgs/MarkerArray (only centerline gradient)
+  /track_centerline_path nav_msgs/Path
+
+Params:
+  pgm_file, yaml_file, frame_id
+  track_is_free (true: grid==0 is track), treat_unknown_as_obstacle
+  spur_prune_iters, node_merge_radius_cells
+  publish_rate_hz, marker_line_width
+  publish_centerline_path
+  save_csv, csv_out, csv_stride
+"""
+
+import os
+import csv
+import yaml
+import math
+import numpy as np
+import cv2
+
 import rclpy
 from rclpy.node import Node
 
-import yaml
-import csv
-import cv2
-import numpy as np
-import os
-from math import acos
-
 from nav_msgs.msg import OccupancyGrid, Path
-from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import PoseStamped, Point
+from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import ColorRGBA
 
-from scipy.interpolate import splprep, splev
+
+_HAVE_SKIMAGE = False
+try:
+    from skimage.morphology import skeletonize as sk_skeletonize
+    _HAVE_SKIMAGE = True
+except Exception:
+    _HAVE_SKIMAGE = False
 
 
 def clamp(x, a, b):
     return max(a, min(b, x))
 
 
-class GenerateTraj(Node):
+class TrackGraphFromGrid(Node):
     def __init__(self):
-        super().__init__("generate_traj")
+        super().__init__("track_graph_from_grid")
 
-        # =========================
-        # PARAMETER
-        # =========================
-        self.declare_parameter('pgm_file', '/home/nvidia/theta_ws/maps/track_map3.pgm')
-        self.declare_parameter('yaml_file', '/home/nvidia/theta_ws/maps/track_map3.yaml')
-        self.declare_parameter('cones_csv', '/home/nvidia/theta_ws/src/track_planner_grid/cones/cones.csv')
-        self.declare_parameter('frame_id', 'map')
+        # -------------------------
+        # PARAMETERS
+        # -------------------------
+        self.declare_parameter("pgm_file", "maps/track_map3.pgm")
+        self.declare_parameter("yaml_file", "maps/track_map3.yaml")
+        self.declare_parameter("frame_id", "map")
 
-        # cone viz
-        self.declare_parameter('cone_radius', 0.15)
-        self.declare_parameter('cone_height', 0.5)
+        self.declare_parameter("track_is_free", True)
+        self.declare_parameter("treat_unknown_as_obstacle", False)
 
-        # graph / geometry
-        self.declare_parameter('same_line_radius', 0.30)   # <— WICHTIG: gleiche Linie
-        self.declare_parameter('min_edge_dist', 0.05)      # gegen doppelte Punkte
-        self.declare_parameter('resample_points', 400)
+        self.declare_parameter("spur_prune_iters", 8)
+        self.declare_parameter("node_merge_radius_cells", 2)
 
-        # smoothing
-        self.declare_parameter('smoothing', 0.8)
-        self.declare_parameter('closed_track', False)      # wenn true: per=True in spline
+        self.declare_parameter("publish_rate_hz", 1.0)
+        self.declare_parameter("marker_line_width", 0.06)
+        self.declare_parameter("publish_centerline_path", True)
 
-        self.frame_id = self.get_parameter('frame_id').value
-        self.cone_radius = float(self.get_parameter('cone_radius').value)
-        self.cone_height = float(self.get_parameter('cone_height').value)
+        self.declare_parameter("save_csv", True)
 
-        self.same_line_radius = float(self.get_parameter('same_line_radius').value)
-        self.min_edge_dist = float(self.get_parameter('min_edge_dist').value)
-        self.resample_points = int(self.get_parameter('resample_points').value)
+        self.declare_parameter("csv_out", "/home/finn/Desktop/AutonmFahren/src/track_planner_grid/track/trajectory.csv")
+        self.declare_parameter("csv_stride", 1)
 
-        self.smoothing = float(self.get_parameter('smoothing').value)
-        self.closed_track = bool(self.get_parameter('closed_track').value)
+        # -------------------------
+        # READ PARAMS
+        # -------------------------
+        self.pgm_file = self.get_parameter("pgm_file").value
+        self.yaml_file = self.get_parameter("yaml_file").value
+        self.frame_id = self.get_parameter("frame_id").value
 
-        pgm_file = self.get_parameter('pgm_file').value
-        yaml_file = self.get_parameter('yaml_file').value
-        cones_csv = self.get_parameter('cones_csv').value
+        self.track_is_free = bool(self.get_parameter("track_is_free").value)
+        self.treat_unknown_as_obstacle = bool(self.get_parameter("treat_unknown_as_obstacle").value)
 
-        # =========================
-        # PUBLISHER
-        # =========================
-        self.map_pub = self.create_publisher(OccupancyGrid, '/map', 1)
-        self.cone_pub = self.create_publisher(MarkerArray, '/virtual_cones', 10)
+        self.spur_prune_iters = int(self.get_parameter("spur_prune_iters").value)
+        self.node_merge_radius_cells = int(self.get_parameter("node_merge_radius_cells").value)
 
-        # Boundary-Lines + Midline
-        self.debug_pub = self.create_publisher(MarkerArray, '/track_debug_markers', 10)
+        self.publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
+        self.marker_line_width = float(self.get_parameter("marker_line_width").value)
+        self.publish_centerline_path = bool(self.get_parameter("publish_centerline_path").value)
 
-        # Final trajectory
-        self.path_pub = self.create_publisher(Path, '/trajectory_path', 10)
+        # -------------------------
+        # PUBLISHERS
+        # -------------------------
+        self.pub_map_raw = self.create_publisher(OccupancyGrid, "/map_raw", 1)
+        self.pub_map_mask = self.create_publisher(OccupancyGrid, "/map_track_mask", 1)
+        self.pub_map_skel = self.create_publisher(OccupancyGrid, "/map_skeleton", 1)
 
-        # =========================
-        # LOAD
-        # =========================
-        self.map_msg = self.load_map(pgm_file, yaml_file)
-        self.cones = self.load_cones(cones_csv)
-        if len(self.cones) < 4:
-            raise RuntimeError("Zu wenige Cones in CSV")
+        self.pub_markers = self.create_publisher(MarkerArray, "/track_graph_markers", 10)
+        self.pub_path = self.create_publisher(Path, "/track_centerline_path", 10)
 
-        # =========================
-        # BUILD CENTERLINE
-        # =========================
-        adj = self.build_graph(self.cones, self.same_line_radius, self.min_edge_dist)
-        comps = self.connected_components(adj)
+        # -------------------------
+        # LOAD + PROCESS ONCE
+        # -------------------------
+        self.map_raw, _ = self.load_map_as_occupancygrid(self.pgm_file, self.yaml_file)
+        self.H = self.map_raw.info.height
+        self.W = self.map_raw.info.width
 
-        # nehme die zwei größten Komponenten als Grenzen
-        comps = sorted(comps, key=lambda c: len(c), reverse=True)
-        if len(comps) < 2:
-            raise RuntimeError(f"Nur {len(comps)} Connected Component(s) gefunden. same_line_radius prüfen!")
+        grid_np = np.array(self.map_raw.data, dtype=np.int16).reshape((self.H, self.W))
 
-        compA = comps[0]
-        compB = comps[1]
+        # Track mask (255=track)
+        track_mask = self.make_track_mask(grid_np)
+        track_mask = self.remove_outside_region(track_mask)
 
-        boundaryA = self.order_component(self.cones, compA, adj)
-        boundaryB = self.order_component(self.cones, compB, adj)
+        # Skeletonize + prune
+        skel = self.skeletonize(track_mask)
+        skel_pruned = self.prune_spurs(skel, iters=self.spur_prune_iters)
 
-        # Resample entlang Bogenlänge auf gleiche Anzahl Punkte
-        A_rs = self.resample_polyline(boundaryA, self.resample_points, closed=False)
-        B_rs = self.resample_polyline(boundaryB, self.resample_points, closed=False)
+        # Loop trace
+        loop_pixels = self.trace_loop_simple(
+            skel_pruned,
+            merge_radius=self.node_merge_radius_cells,
+            restarts=80
+        )
 
-        # Paarung: gleiche "Laufrichtung" erzwingen (falls invertiert)
-        if np.linalg.norm(A_rs[0] - B_rs[0]) > np.linalg.norm(A_rs[0] - B_rs[-1]):
-            B_rs = B_rs[::-1].copy()
+        if loop_pixels and len(loop_pixels) > 20:
+            loop_pixels = self.rotate_list_random(loop_pixels)
+            self.centerline_pixels = loop_pixels
+            self.get_logger().info(f"✅ Loop found: {len(self.centerline_pixels)} points")
+        else:
+            self.centerline_pixels = []
+            self.get_logger().warn("❌ No loop found (simple).")
 
-        mid = 0.5 * (A_rs + B_rs)
+        # Save CSV (world coords + yaw + curvature)
+        if bool(self.get_parameter("save_csv").value) and self.centerline_pixels:
+            out_path = self.get_parameter("csv_out").value
+            stride = int(self.get_parameter("csv_stride").value)
+            self.save_centerline_csv(out_path, stride=stride)
+            self.get_logger().info(f"💾 Saved trajectory CSV: {out_path}")
 
-        # Kreuzungen / Zickzack: Richtungs-Glättung (zusätzlich zur Spline)
-        mid = self.direction_filter(mid, max_turn_deg=65.0)
+        # RViz occupancy grids
+        self.map_mask = self.mask_to_occgrid(track_mask, topic_frame=self.frame_id)
+        self.map_skel = self.mask_to_occgrid(skel_pruned, topic_frame=self.frame_id)
 
-        # Spline glätten
-        self.trajectory = self.spline_smooth(mid, self.resample_points, self.smoothing, closed=self.closed_track)
+        # Timer
+        period = 1.0 / max(0.1, self.publish_rate_hz)
+        self.timer = self.create_timer(period, self.publish_all)
 
-        # für Visualisierung
-        self.boundaryA = A_rs
-        self.boundaryB = B_rs
-        self.midpoints = mid
-
-        self.timer = self.create_timer(1.0, self.publish_all)
-        self.get_logger().info("✅ Trajektorie generiert (Graph Components → Centerline).")
+        self.get_logger().info(f"✅ Ready. (skimage={'yes' if _HAVE_SKIMAGE else 'no'})")
 
     # ==========================================================
-    # MAP
+    # MAP LOADING (PGM+YAML -> OccupancyGrid)
     # ==========================================================
-    def load_map(self, pgm_file, yaml_file):
+    def load_map_as_occupancygrid(self, pgm_file, yaml_file):
         if not os.path.exists(pgm_file):
-            raise RuntimeError("PGM-Datei nicht gefunden")
+            raise RuntimeError(f"PGM not found: {pgm_file}")
         if not os.path.exists(yaml_file):
-            raise RuntimeError("YAML-Datei nicht gefunden")
+            raise RuntimeError(f"YAML not found: {yaml_file}")
 
-        with open(yaml_file, 'r') as f:
-            map_info = yaml.safe_load(f)
+        with open(yaml_file, "r") as f:
+            info = yaml.safe_load(f)
 
-        resolution = map_info['resolution']
-        origin = map_info['origin']
-        free_thresh = map_info.get('free_thresh', 0.196)
-        occupied_thresh = map_info.get('occupied_thresh', 0.65)
+        resolution = float(info["resolution"])
+        origin = info["origin"]
+        negate = int(info.get("negate", 0))
+        free_thresh = float(info.get("free_thresh", 0.25))
+        occupied_thresh = float(info.get("occupied_thresh", 0.65))
 
         img = cv2.imread(pgm_file, cv2.IMREAD_GRAYSCALE)
         if img is None:
-            raise RuntimeError("PGM konnte nicht gelesen werden")
+            raise RuntimeError("Could not read PGM image")
 
-        height, width = img.shape
+        H, W = img.shape
+        img_u = (255 - img).astype(np.uint8) if negate else img
+        img_f = img_u.astype(np.float32) / 255.0
 
-        grid = OccupancyGrid()
-        grid.header.frame_id = self.frame_id
-        grid.info.resolution = resolution
-        grid.info.width = width
-        grid.info.height = height
+        data = np.full((H, W), -1, dtype=np.int16)
+        data[img_f > free_thresh] = 0
+        data[img_f < occupied_thresh] = 100
 
-        grid.info.origin.position.x = origin[0]
-        grid.info.origin.position.y = origin[1]
-        grid.info.origin.position.z = 0.0
-        grid.info.origin.orientation.w = 1.0
+        # Align with RViz (same as earlier code)
+        data = np.flipud(data)
 
-        data = []
-        for y in range(height):
-            for x in range(width):
-                pixel = img[height - y - 1, x] / 255.0
-                if pixel > free_thresh:
-                    data.append(0)
-                elif pixel < occupied_thresh:
-                    data.append(100)
-                else:
-                    data.append(-1)
-
-        grid.data = data
-        return grid
+        msg = OccupancyGrid()
+        msg.header.frame_id = self.frame_id
+        msg.info.resolution = resolution
+        msg.info.width = W
+        msg.info.height = H
+        msg.info.origin.position.x = float(origin[0])
+        msg.info.origin.position.y = float(origin[1])
+        msg.info.origin.position.z = 0.0
+        msg.info.origin.orientation.w = 1.0
+        msg.data = data.reshape(-1).tolist()
+        return msg, {"resolution": resolution, "origin": origin, "H": H, "W": W}
 
     # ==========================================================
-    # CONES
+    # TRACK MASK
     # ==========================================================
-    def load_cones(self, csv_file):
-        cones = []
-        if not os.path.exists(csv_file):
-            raise RuntimeError("cones_csv nicht gefunden")
-
-        with open(csv_file, newline='') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                cones.append([float(row['x']), float(row['y'])])
-
-        return np.array(cones, dtype=np.float32)
-
-    # ==========================================================
-    # GRAPH: connect cones on SAME boundary line
-    # ==========================================================
-    def build_graph(self, pts, radius, min_dist):
-        n = len(pts)
-        adj = [[] for _ in range(n)]
-        for i in range(n):
-            di = pts - pts[i]
-            d = np.linalg.norm(di, axis=1)
-            for j in range(n):
-                if i == j:
-                    continue
-                if min_dist < d[j] <= radius:
-                    adj[i].append(j)
-        # optional: sort neighbor lists by distance (stabiler)
-        for i in range(n):
-            adj[i].sort(key=lambda j: np.linalg.norm(pts[j] - pts[i]))
-        return adj
-
-    def connected_components(self, adj):
-        n = len(adj)
-        vis = [False]*n
-        comps = []
-        for i in range(n):
-            if vis[i]:
-                continue
-            stack = [i]
-            vis[i] = True
-            comp = []
-            while stack:
-                u = stack.pop()
-                comp.append(u)
-                for v in adj[u]:
-                    if not vis[v]:
-                        vis[v] = True
-                        stack.append(v)
-            comps.append(comp)
-        return comps
-
-    # ==========================================================
-    # ORDER COMPONENT as a polyline
-    # - if there are endpoints (degree 1), start there
-    # - if branches, choose neighbor with smallest turning angle
-    # ==========================================================
-    def order_component(self, pts, comp, adj):
-        comp_set = set(comp)
-
-        # degree within component
-        deg = {i: sum((j in comp_set) for j in adj[i]) for i in comp}
-
-        endpoints = [i for i in comp if deg[i] == 1]
-        if len(endpoints) >= 1:
-            start = endpoints[0]
+    def make_track_mask(self, grid_np: np.ndarray) -> np.ndarray:
+        if self.track_is_free:
+            track = (grid_np == 0)
         else:
-            # loop or all deg==2: start at arbitrary
-            start = comp[0]
+            track = (grid_np == 100)
 
-        ordered = [start]
-        used = set([start])
+        if self.treat_unknown_as_obstacle:
+            track = track & (grid_np != -1)
 
-        # initial direction: pick closest neighbor in component
-        neigh = [j for j in adj[start] if j in comp_set]
-        if not neigh:
-            return pts[comp]
+        return (track.astype(np.uint8) * 255)
 
-        current = start
+    # ==========================================================
+    # REMOVE OUTSIDE REGION
+    # ==========================================================
+    def remove_outside_region(self, track_mask255: np.ndarray) -> np.ndarray:
+        m = (track_mask255 > 0).astype(np.uint8)
+        H, W = m.shape
+
+        outside = np.zeros((H, W), dtype=np.uint8)
+        stack = []
+
+        for c in range(W):
+            if m[0, c]: stack.append((0, c))
+            if m[H - 1, c]: stack.append((H - 1, c))
+        for r in range(H):
+            if m[r, 0]: stack.append((r, 0))
+            if m[r, W - 1]: stack.append((r, W - 1))
+
+        N4 = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+        while stack:
+            r, c = stack.pop()
+            if outside[r, c]:
+                continue
+            outside[r, c] = 1
+            for dr, dc in N4:
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < H and 0 <= cc < W and m[rr, cc] and not outside[rr, cc]:
+                    stack.append((rr, cc))
+
+        inside = (m == 1) & (outside == 0)
+        return (inside.astype(np.uint8) * 255)
+
+    # ==========================================================
+    # SKELETONIZE
+    # ==========================================================
+    def skeletonize(self, mask255: np.ndarray) -> np.ndarray:
+        bin01 = (mask255 > 0).astype(np.uint8)
+
+        try:
+            if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "thinning"):
+                skel01 = cv2.ximgproc.thinning(
+                    bin01 * 255, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN
+                )
+                skel01 = (skel01 > 0).astype(np.uint8)
+                return skel01 * 255
+        except Exception:
+            pass
+
+        if not _HAVE_SKIMAGE:
+            raise RuntimeError(
+                "No cv2.ximgproc.thinning AND no skimage.skeletonize available. "
+                "Install python3-opencv-contrib or python3-skimage."
+            )
+        skel01 = sk_skeletonize(bin01.astype(bool)).astype(np.uint8)
+        return skel01 * 255
+
+    # ==========================================================
+    # PRUNE SPURS
+    # ==========================================================
+    def prune_spurs(self, skel255: np.ndarray, iters: int = 8) -> np.ndarray:
+        sk = (skel255 > 0).astype(np.uint8)
+        H, W = sk.shape
+
+        def neighbors_count(r, c):
+            nb = 0
+            for rr in range(max(0, r - 1), min(H - 1, r + 1) + 1):
+                for cc in range(max(0, c - 1), min(W - 1, c + 1) + 1):
+                    if rr == r and cc == c:
+                        continue
+                    nb += int(sk[rr, cc] != 0)
+            return nb
+
+        for _ in range(max(0, iters)):
+            to_remove = []
+            ys, xs = np.where(sk != 0)
+            for r, c in zip(ys, xs):
+                if neighbors_count(r, c) <= 1:
+                    to_remove.append((r, c))
+            if not to_remove:
+                break
+            for r, c in to_remove:
+                sk[r, c] = 0
+
+        return sk * 255
+
+    # ==========================================================
+    # JUNCTION CLUSTERING
+    # ==========================================================
+    def cluster_junctions(self, skel01: np.ndarray, merge_radius=2):
+        sk = skel01.astype(np.uint8)
+        H, W = sk.shape
+        N8 = [(-1, -1), (-1, 0), (-1, 1),
+              (0, -1),           (0, 1),
+              (1, -1),  (1, 0),  (1, 1)]
+
+        # degree
+        deg = np.zeros((H, W), np.uint8)
+        ys, xs = np.where(sk)
+        for r, c in zip(ys, xs):
+            cnt = 0
+            for dr, dc in N8:
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < H and 0 <= cc < W and sk[rr, cc]:
+                    cnt += 1
+            deg[r, c] = cnt
+
+        junc = (sk == 1) & (deg >= 3)
+
+        # merge nearby by dilating junction mask
+        if merge_radius > 0:
+            k = 2 * merge_radius + 1
+            ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            junc = cv2.dilate(junc.astype(np.uint8) * 255, ker) > 0
+            junc = junc & (sk == 1)
+
+        cluster_id = -np.ones((H, W), np.int32)
+        cid = 0
+        for r, c in zip(*np.where(junc)):
+            if cluster_id[r, c] != -1:
+                continue
+            stack = [(r, c)]
+            cluster_id[r, c] = cid
+            while stack:
+                rr, cc = stack.pop()
+                for dr, dc in N8:
+                    r2, c2 = rr + dr, cc + dc
+                    if 0 <= r2 < H and 0 <= c2 < W and junc[r2, c2] and cluster_id[r2, c2] == -1:
+                        cluster_id[r2, c2] = cid
+                        stack.append((r2, c2))
+            cid += 1
+
+        return cluster_id, cid  # cid = number of clusters
+
+    def get_ports(self, skel01, cluster_id, cid):
+        H, W = skel01.shape
+        N8 = [(-1, -1), (-1, 0), (-1, 1),
+              (0, -1),           (0, 1),
+              (1, -1),  (1, 0),  (1, 1)]
+
+        ports = set()
+        ys, xs = np.where(cluster_id == cid)
+        for r, c in zip(ys, xs):
+            for dr, dc in N8:
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < H and 0 <= cc < W and skel01[rr, cc] and cluster_id[rr, cc] != cid:
+                    ports.add((rr, cc))
+        return list(ports)
+
+    def follow_arm_direction(self, skel01, cluster_id, start, steps=8):
+        H, W = skel01.shape
+        N8 = [(-1, -1), (-1, 0), (-1, 1),
+              (0, -1),           (0, 1),
+              (1, -1),  (1, 0),  (1, 1)]
+
         prev = None
-        nxt = neigh[0]
+        cur = start
 
-        ordered.append(nxt)
-        used.add(nxt)
-        prev = current
-        current = nxt
-
-        while len(used) < len(comp_set):
-            cand = [j for j in adj[current] if j in comp_set and j not in used]
-            if not cand:
-                # if stuck (branch artifacts), allow revisit but prevent infinite:
-                cand = [j for j in adj[current] if j in comp_set and j != prev]
-                if not cand:
-                    break
-
-            # choose best continuation by smallest turning angle
-            v1 = pts[current] - pts[prev]
-            n1 = np.linalg.norm(v1)
-            if n1 < 1e-6:
-                v1 = np.array([1.0, 0.0], dtype=np.float32)
-                n1 = 1.0
-            v1 = v1 / n1
-
-            best = None
-            best_ang = 1e9
-            for j in cand:
-                v2 = pts[j] - pts[current]
-                n2 = np.linalg.norm(v2)
-                if n2 < 1e-6:
-                    continue
-                v2 = v2 / n2
-                dot = clamp(float(np.dot(v1, v2)), -1.0, 1.0)
-                ang = acos(dot)  # radians
-                if ang < best_ang:
-                    best_ang = ang
-                    best = j
-
-            if best is None:
+        for _ in range(steps):
+            nbrs = []
+            for dr, dc in N8:
+                rr, cc = cur[0] + dr, cur[1] + dc
+                if 0 <= rr < H and 0 <= cc < W and skel01[rr, cc]:
+                    if prev is not None and (rr, cc) == prev:
+                        continue
+                    # don't go into junction clusters
+                    if cluster_id[rr, cc] != -1:
+                        continue
+                    nbrs.append((rr, cc))
+            if not nbrs:
                 break
 
-            ordered.append(best)
-            used.add(best)
-            prev, current = current, best
+            # pick neighbor that is straightest relative to prev->cur if possible
+            nxt = nbrs[0]
+            if prev is not None and len(nbrs) > 1:
+                v_in = np.array([cur[0] - prev[0], cur[1] - prev[1]], np.float32)
+                n = np.linalg.norm(v_in)
+                v_in = v_in / n if n > 1e-6 else np.array([1.0, 0.0], np.float32)
+                best_dot = -1e9
+                for cand in nbrs:
+                    v_out = np.array([cand[0] - cur[0], cand[1] - cur[1]], np.float32)
+                    m = np.linalg.norm(v_out)
+                    if m < 1e-6:
+                        continue
+                    v_out /= m
+                    d = float(np.dot(v_in, v_out))
+                    if d > best_dot:
+                        best_dot = d
+                        nxt = cand
 
-        return pts[np.array(ordered, dtype=np.int32)]
+            prev, cur = cur, nxt
+
+        v = np.array([cur[0] - start[0], cur[1] - start[1]], np.float32)
+        n = np.linalg.norm(v)
+        if n < 1e-6:
+            return np.array([1.0, 0.0], np.float32)
+        return v / n
+
+    def choose_middle_arm(self, prev_pix, cur_pix, ports, skel01, cluster_id):
+        v_in = np.array([cur_pix[0] - prev_pix[0], cur_pix[1] - prev_pix[1]], np.float32)
+        n = np.linalg.norm(v_in)
+        v_in = v_in / n if n > 1e-6 else np.array([1.0, 0.0], np.float32)
+
+        best_port = None
+        best_dot = -1e9
+        for p in ports:
+            if p == prev_pix:  # avoid immediate U-turn
+                continue
+            v_out = self.follow_arm_direction(skel01, cluster_id, p, steps=8)
+            d = float(np.dot(v_in, v_out))
+            if d > best_dot:
+                best_dot = d
+                best_port = p
+        return best_port
+
+    def trace_loop_simple(self, skel255, merge_radius=2, restarts=50, max_steps=200000):
+        sk = (skel255 > 0).astype(np.uint8)
+        H, W = sk.shape
+        N8 = [(-1, -1), (-1, 0), (-1, 1),
+              (0, -1),           (0, 1),
+              (1, -1),  (1, 0),  (1, 1)]
+
+        cluster_id, _num = self.cluster_junctions(sk, merge_radius=merge_radius)
+
+        ys, xs = np.where(sk)
+        if len(ys) == 0:
+            return []
+
+        rng = np.random.default_rng()
+
+        def neighbors(p):
+            r, c = p
+            out = []
+            for dr, dc in N8:
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < H and 0 <= cc < W and sk[rr, cc]:
+                    out.append((rr, cc))
+            return out
+
+        for _ in range(restarts):
+            start = (int(rng.choice(ys)), int(rng.choice(xs)))
+            if cluster_id[start[0], start[1]] != -1:
+                continue
+
+            path = [start]
+            prev = None
+            cur = start
+            visited_edges = set()
+
+            for _step in range(max_steps):
+                nbrs = neighbors(cur)
+                if prev is not None:
+                    nbrs = [p for p in nbrs if p != prev]
+                if not nbrs:
+                    break
+
+                # choose straight locally if multiple
+                nxt = nbrs[0]
+                if prev is not None and len(nbrs) > 1:
+                    v_in = np.array([cur[0] - prev[0], cur[1] - prev[1]], np.float32)
+                    n = np.linalg.norm(v_in)
+                    v_in = v_in / n if n > 1e-6 else np.array([1.0, 0.0], np.float32)
+                    best_dot = -1e9
+                    for cand in nbrs:
+                        v_out = np.array([cand[0] - cur[0], cand[1] - cur[1]], np.float32)
+                        m = np.linalg.norm(v_out)
+                        if m < 1e-6:
+                            continue
+                        v_out /= m
+                        d = float(np.dot(v_in, v_out))
+                        if d > best_dot:
+                            best_dot = d
+                            nxt = cand
+
+                # entering junction? decide arm and jump to port
+                cid = cluster_id[nxt[0], nxt[1]]
+                if cid != -1 and prev is not None:
+                    ports = self.get_ports(sk, cluster_id, cid)
+                    best_port = self.choose_middle_arm(prev_pix=cur, cur_pix=nxt, ports=ports,
+                                                       skel01=sk, cluster_id=cluster_id)
+                    if best_port is None:
+                        break
+                    path.append(nxt)  # for visualization continuity
+                    prev, cur = cur, best_port
+                    path.append(cur)
+                else:
+                    prev, cur = cur, nxt
+                    path.append(cur)
+
+                edge = (prev, cur)
+                if edge in visited_edges:
+                    break
+                visited_edges.add(edge)
+
+                if cur == start and len(path) > 80:
+                    return path
+
+        return []
+
+    def rotate_list_random(self, lst):
+        if not lst:
+            return lst
+        k = int(np.random.randint(0, len(lst)))
+        return lst[k:] + lst[:k]
 
     # ==========================================================
-    # RESAMPLE polyline by arclength
+    # CSV: curvature + yaw
     # ==========================================================
-    def resample_polyline(self, poly, M, closed=False):
-        if len(poly) < 2:
-            return poly
+    def compute_curvature_and_yaw(
+        self,
+        xy: np.ndarray,
+        closed: bool = True,
+        ds_target: float = 0.10,     # gewünschter Punktabstand [m]
+        smooth_win: int = 21,        # Fenstergröße (ungerade!) in Samples nach Resample
+        curv_lpf_win: int = 31       # extra Glättung nur für curvature
+    ):
+        """
+        Smooth yaw + curvature for a (closed) loop trajectory.
+
+        Steps:
+        1) Resample by arc length to approximately constant spacing ds_target
+        2) Smooth x,y (Savitzky-Golay if available, else circular moving average)
+        3) Compute yaw + curvature from derivatives wrt s
+        4) Lowpass curvature again (circular moving average)
+
+        Returns:
+        yaw (N,), curvature (N,), s (N,), xy_rs (N,2)
+        """
+        xy = np.asarray(xy, dtype=np.float32)
+        N0 = len(xy)
+        if N0 < 5:
+            yaw = np.zeros((N0,), np.float32)
+            curv = np.zeros((N0,), np.float32)
+            s = np.zeros((N0,), np.float32)
+            return yaw, curv, s, xy
+
+        # --------------------------
+        # 1) Arc-length resample
+        # --------------------------
+        if closed:
+            pts = np.vstack([xy, xy[0]])
+        else:
+            pts = xy.copy()
+
+        seg = np.linalg.norm(pts[1:] - pts[:-1], axis=1)
+        L = float(np.sum(seg))
+        if L < 1e-6:
+            yaw = np.zeros((N0,), np.float32)
+            curv = np.zeros((N0,), np.float32)
+            s = np.zeros((N0,), np.float32)
+            return yaw, curv, s, xy
+
+        s_src = np.concatenate([[0.0], np.cumsum(seg)]).astype(np.float32)
+
+        M = max(10, int(round(L / max(1e-3, ds_target))))
+        s_tgt = np.linspace(0.0, L, M, dtype=np.float32)
+
+        # linear interpolation x(s), y(s)
+        x_src = pts[:, 0].astype(np.float32)
+        y_src = pts[:, 1].astype(np.float32)
+        x = np.interp(s_tgt, s_src, x_src).astype(np.float32)
+        y = np.interp(s_tgt, s_src, y_src).astype(np.float32)
+
+        xy_rs = np.stack([x, y], axis=1)
+
+        # --------------------------
+        # helper: circular moving average
+        # --------------------------
+        def circ_movavg(a: np.ndarray, win: int) -> np.ndarray:
+            win = int(win)
+            if win < 3:
+                return a
+            if win % 2 == 0:
+                win += 1
+            pad = win // 2
+            ap = np.concatenate([a[-pad:], a, a[:pad]])
+            k = np.ones((win,), dtype=np.float32) / float(win)
+            out = np.convolve(ap, k, mode="valid").astype(np.float32)
+            return out
+
+        # --------------------------
+        # 2) Smooth x,y
+        # --------------------------
+        win = int(smooth_win)
+        if win % 2 == 0:
+            win += 1
+        win = max(5, min(win, M - (1 - M % 2)))  # <= M and odd
+
+        used_savgol = False
+        try:
+            # optional: Savitzky-Golay for smooth derivatives
+            from scipy.signal import savgol_filter
+            # polyorder 3 is usually stable for tracks
+            x_s = savgol_filter(x, window_length=win, polyorder=3, mode="wrap" if closed else "interp").astype(np.float32)
+            y_s = savgol_filter(y, window_length=win, polyorder=3, mode="wrap" if closed else "interp").astype(np.float32)
+            used_savgol = True
+        except Exception:
+            x_s = circ_movavg(x, win) if closed else np.convolve(x, np.ones(win)/win, mode="same").astype(np.float32)
+            y_s = circ_movavg(y, win) if closed else np.convolve(y, np.ones(win)/win, mode="same").astype(np.float32)
+
+        # --------------------------
+        # 3) Derivatives wrt s (ds ~ constant)
+        # --------------------------
+        ds = float(L / max(1, (M - 1)))  # approx constant spacing
+
+        if used_savgol:
+            # if we already have savgol, we can get smooth derivatives directly
+            try:
+                from scipy.signal import savgol_filter
+                dx = savgol_filter(x, window_length=win, polyorder=3, deriv=1, delta=ds,
+                                mode="wrap" if closed else "interp").astype(np.float32)
+                dy = savgol_filter(y, window_length=win, polyorder=3, deriv=1, delta=ds,
+                                mode="wrap" if closed else "interp").astype(np.float32)
+                ddx = savgol_filter(x, window_length=win, polyorder=3, deriv=2, delta=ds,
+                                    mode="wrap" if closed else "interp").astype(np.float32)
+                ddy = savgol_filter(y, window_length=win, polyorder=3, deriv=2, delta=ds,
+                                    mode="wrap" if closed else "interp").astype(np.float32)
+            except Exception:
+                # fallback if deriv call fails for any reason
+                dx = np.gradient(x_s, ds).astype(np.float32)
+                dy = np.gradient(y_s, ds).astype(np.float32)
+                ddx = np.gradient(dx, ds).astype(np.float32)
+                ddy = np.gradient(dy, ds).astype(np.float32)
+        else:
+            dx = np.gradient(x_s, ds).astype(np.float32)
+            dy = np.gradient(y_s, ds).astype(np.float32)
+            ddx = np.gradient(dx, ds).astype(np.float32)
+            ddy = np.gradient(dy, ds).astype(np.float32)
+
+        yaw = np.arctan2(dy, dx).astype(np.float32)
+
+        # curvature formula
+        denom = (dx * dx + dy * dy) ** 1.5
+        denom = np.maximum(denom, 1e-8).astype(np.float32)
+        curv = (dx * ddy - dy * ddx) / denom
+        curv = curv.astype(np.float32)
+
+        # --------------------------
+        # 4) Extra lowpass on curvature (really helps)
+        # --------------------------
+        win2 = int(curv_lpf_win)
+        if win2 % 2 == 0:
+            win2 += 1
+        win2 = max(5, min(win2, M - (1 - M % 2)))
 
         if closed:
-            p = np.vstack([poly, poly[0]])
+            curv = circ_movavg(curv, win2)
+            # yaw also a bit (optional, but usually nice)
+            # use sin/cos averaging to respect wrap-around
+            yaw_sin = circ_movavg(np.sin(yaw).astype(np.float32), win2)
+            yaw_cos = circ_movavg(np.cos(yaw).astype(np.float32), win2)
+            yaw = np.arctan2(yaw_sin, yaw_cos).astype(np.float32)
         else:
-            p = poly
+            k = np.ones((win2,), dtype=np.float32) / float(win2)
+            curv = np.convolve(curv, k, mode="same").astype(np.float32)
 
-        seg = np.linalg.norm(p[1:] - p[:-1], axis=1)
-        s = np.concatenate([[0.0], np.cumsum(seg)])
-        L = s[-1]
-        if L < 1e-6:
-            return np.repeat(poly[:1], M, axis=0)
+        # s output
+        s = s_tgt.astype(np.float32)
 
-        t = np.linspace(0.0, L, M)
-        out = np.zeros((M, 2), dtype=np.float32)
+        # return resampled trajectory outputs (note: now length M)
+        return yaw, curv, s, np.stack([x_s, y_s], axis=1).astype(np.float32)
 
-        # piecewise linear interpolation
-        k = 0
-        for i in range(M):
-            while k < len(s)-2 and t[i] > s[k+1]:
-                k += 1
-            a = s[k]
-            b = s[k+1]
-            w = 0.0 if (b-a) < 1e-9 else (t[i]-a)/(b-a)
-            out[i] = (1.0-w)*p[k] + w*p[k+1]
-        return out
 
-    # ==========================================================
-    # Direction filter to keep "straight through" at crossings
-    # ==========================================================
-    def direction_filter(self, pts, max_turn_deg=65.0):
-        if len(pts) < 3:
-            return pts
-        max_turn = np.deg2rad(max_turn_deg)
-        keep = [pts[0], pts[1]]
-        for i in range(2, len(pts)):
-            a = keep[-2]
-            b = keep[-1]
-            c = pts[i]
-            v1 = b - a
-            v2 = c - b
-            n1 = np.linalg.norm(v1)
-            n2 = np.linalg.norm(v2)
-            if n1 < 1e-6 or n2 < 1e-6:
-                keep.append(c)
-                continue
-            v1 /= n1
-            v2 /= n2
-            ang = acos(clamp(float(np.dot(v1, v2)), -1.0, 1.0))
-            if ang > max_turn:
-                # too sharp → skip this point (forces straighter path)
-                continue
-            keep.append(c)
-        return np.array(keep, dtype=np.float32)
+    def save_centerline_csv(self, csv_path: str, stride: int = 1):
+        if not self.centerline_pixels:
+            self.get_logger().warn("No centerline_pixels to save.")
+            return
+
+        stride = max(1, int(stride))
+
+        # rc -> world xy
+        xy = []
+        for (r, c) in self.centerline_pixels[::stride]:
+            x, y = self.rc_to_world(r, c)
+            xy.append([x, y])
+        xy = np.array(xy, dtype=np.float32)
+
+        # NEW: smooth + resample + curvature
+        yaw, curv, s, xy_smooth = self.compute_curvature_and_yaw(
+            xy,
+            closed=True,
+            ds_target=0.10,      # <- tunen
+            smooth_win=21,       # <- tunen
+            curv_lpf_win=31      # <- tunen
+        )
+
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["x", "y", "yaw", "curvature", "s"])
+            for i in range(len(xy_smooth)):
+                w.writerow([
+                    float(xy_smooth[i, 0]),
+                    float(xy_smooth[i, 1]),
+                    float(yaw[i]),
+                    float(curv[i]),
+                    float(s[i]),
+                ])
+
 
     # ==========================================================
-    # SPLINE
+    # OccupancyGrid helper
     # ==========================================================
-    def spline_smooth(self, pts, M, smoothing, closed=False):
-        if len(pts) < 4:
-            return pts
-        try:
-            tck, _ = splprep([pts[:, 0], pts[:, 1]], s=smoothing, per=closed)
-            u = np.linspace(0, 1, M)
-            x, y = splev(u, tck)
-            return np.vstack([x, y]).T.astype(np.float32)
-        except Exception as e:
-            self.get_logger().warn(f"Spline failed: {e}")
-            return pts
+    def mask_to_occgrid(self, mask255: np.ndarray, topic_frame="map") -> OccupancyGrid:
+        msg = OccupancyGrid()
+        msg.header.frame_id = topic_frame
+        msg.info = self.map_raw.info
+        occ = np.full(mask255.shape, 100, dtype=np.int16)
+        occ[mask255 > 0] = 0
+        msg.data = occ.reshape(-1).tolist()
+        return msg
+
+    # ==========================================================
+    # GRID -> WORLD
+    # ==========================================================
+    def rc_to_world(self, r, c):
+        res = self.map_raw.info.resolution
+        ox = self.map_raw.info.origin.position.x
+        oy = self.map_raw.info.origin.position.y
+        return float(ox + (c + 0.5) * res), float(oy + (r + 0.5) * res)
+
+    # ==========================================================
+    # Color ramp: white -> yellow -> orange -> red
+    # ==========================================================
+    def ramp_white_yellow_orange_red(self, t: float) -> ColorRGBA:
+        t = float(clamp(t, 0.0, 1.0))
+        c = ColorRGBA()
+        c.a = 1.0
+
+        # 0.0 .. 0.33: white (1,1,1) -> yellow (1,1,0)
+        if t < 1.0 / 3.0:
+            u = t / (1.0 / 3.0)
+            c.r = 1.0
+            c.g = 1.0
+            c.b = 1.0 - u  # 1 -> 0
+            return c
+
+        # 0.33 .. 0.66: yellow (1,1,0) -> orange (1,0.5,0)
+        if t < 2.0 / 3.0:
+            u = (t - 1.0 / 3.0) / (1.0 / 3.0)
+            c.r = 1.0
+            c.g = 1.0 - 0.5 * u  # 1 -> 0.5
+            c.b = 0.0
+            return c
+
+        # 0.66 .. 1.0: orange (1,0.5,0) -> red (1,0,0)
+        u = (t - 2.0 / 3.0) / (1.0 / 3.0)
+        c.r = 1.0
+        c.g = 0.5 - 0.5 * u  # 0.5 -> 0
+        c.b = 0.0
+        return c
 
     # ==========================================================
     # PUBLISH
@@ -378,99 +769,60 @@ class GenerateTraj(Node):
     def publish_all(self):
         now = self.get_clock().now().to_msg()
 
-        # Map
-        self.map_msg.header.stamp = now
-        self.map_pub.publish(self.map_msg)
+        self.map_raw.header.stamp = now
+        self.map_mask.header.stamp = now
+        self.map_skel.header.stamp = now
 
-        # Cones
-        cones_ma = MarkerArray()
-        for i, (x, y) in enumerate(self.cones):
-            m = Marker()
-            m.header.frame_id = self.frame_id
-            m.header.stamp = now
-            m.ns = "cones"
-            m.id = i
-            m.type = Marker.CYLINDER
-            m.action = Marker.ADD
-            m.pose.position.x = float(x)
-            m.pose.position.y = float(y)
-            m.pose.position.z = float(self.cone_height / 2.0)
-            m.pose.orientation.w = 1.0
-            m.scale.x = float(self.cone_radius * 2.0)
-            m.scale.y = float(self.cone_radius * 2.0)
-            m.scale.z = float(self.cone_height)
-            m.color.r = 1.0
-            m.color.g = 0.5
-            m.color.b = 0.0
-            m.color.a = 1.0
-            cones_ma.markers.append(m)
-        self.cone_pub.publish(cones_ma)
+        self.pub_map_raw.publish(self.map_raw)
+        self.pub_map_mask.publish(self.map_mask)
+        self.pub_map_skel.publish(self.map_skel)
 
-        # Debug markers: boundaryA (blue), boundaryB (yellow), mid (red points), traj (green line)
-        dbg = MarkerArray()
+        ma = MarkerArray()
 
-        def make_line(ns, mid, pts, rgba, width=0.05):
-            line = Marker()
-            line.header.frame_id = self.frame_id
-            line.header.stamp = now
-            line.ns = ns
-            line.id = mid
-            line.type = Marker.LINE_STRIP
-            line.action = Marker.ADD
-            line.scale.x = width
-            line.color.r, line.color.g, line.color.b, line.color.a = rgba
-            for p in pts:
-                pt = Point()
-                pt.x = float(p[0]); pt.y = float(p[1]); pt.z = 0.05
-                line.points.append(pt)
-            return line
+        # Centerline marker (gradient)
+        if self.centerline_pixels:
+            cl = Marker()
+            cl.header.frame_id = self.frame_id
+            cl.header.stamp = now
+            cl.ns = "centerline_grad"
+            cl.id = 0
+            cl.type = Marker.LINE_STRIP
+            cl.action = Marker.ADD
+            cl.scale.x = self.marker_line_width
+            cl.pose.orientation.w = 1.0
 
-        dbg.markers.append(make_line("boundaryA", 0, self.boundaryA, (0.2, 0.6, 1.0, 1.0), width=0.06))
-        dbg.markers.append(make_line("boundaryB", 1, self.boundaryB, (1.0, 1.0, 0.2, 1.0), width=0.06))
-        dbg.markers.append(make_line("trajectory", 2, self.trajectory, (0.0, 1.0, 0.0, 1.0), width=0.07))
+            N = len(self.centerline_pixels)
+            for i, (r, c) in enumerate(self.centerline_pixels):
+                x, y = self.rc_to_world(r, c)
+                cl.points.append(Point(x=x, y=y, z=0.07))
+                t = i / max(1, (N - 1))
+                cl.colors.append(self.ramp_white_yellow_orange_red(t))
 
-        # midpoints as spheres
-        for i, p in enumerate(self.midpoints[:300]):  # limit marker count
-            s = Marker()
-            s.header.frame_id = self.frame_id
-            s.header.stamp = now
-            s.ns = "midpoints"
-            s.id = 1000 + i
-            s.type = Marker.SPHERE
-            s.action = Marker.ADD
-            s.scale.x = 0.08
-            s.scale.y = 0.08
-            s.scale.z = 0.08
-            s.color.r = 1.0
-            s.color.g = 0.0
-            s.color.b = 0.0
-            s.color.a = 0.9
-            s.pose.position.x = float(p[0])
-            s.pose.position.y = float(p[1])
-            s.pose.position.z = 0.05
-            s.pose.orientation.w = 1.0
-            dbg.markers.append(s)
+            ma.markers.append(cl)
 
-        self.debug_pub.publish(dbg)
+        self.pub_markers.publish(ma)
 
         # Path
-        path = Path()
-        path.header.frame_id = self.frame_id
-        path.header.stamp = now
-        for p in self.trajectory:
-            ps = PoseStamped()
-            ps.header.frame_id = self.frame_id
-            ps.pose.position.x = float(p[0])
-            ps.pose.position.y = float(p[1])
-            ps.pose.position.z = 0.05
-            ps.pose.orientation.w = 1.0
-            path.poses.append(ps)
-        self.path_pub.publish(path)
+        if self.publish_centerline_path and self.centerline_pixels:
+            path = Path()
+            path.header.frame_id = self.frame_id
+            path.header.stamp = now
+            for (r, c) in self.centerline_pixels:
+                x, y = self.rc_to_world(r, c)
+                ps = PoseStamped()
+                ps.header.frame_id = self.frame_id
+                ps.header.stamp = now
+                ps.pose.position.x = x
+                ps.pose.position.y = y
+                ps.pose.position.z = 0.05
+                ps.pose.orientation.w = 1.0
+                path.poses.append(ps)
+            self.pub_path.publish(path)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = GenerateTraj()
+    node = TrackGraphFromGrid()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
