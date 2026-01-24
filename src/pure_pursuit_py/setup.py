@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'pure_pursuit_node = pure_pursuit_py.pure_pursuit_node:main',
             'actuator_to_fsds = pure_pursuit_py.actuator_to_fsds_node:main',
+            'tf_to_odom_node = pure_pursuit_py.tf_to_odom:main',
         ],
     },
 )

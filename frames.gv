@@ -1,12 +1,15 @@
 digraph G {
-"world" -> "Praktikum25_car2"[label=" Broadcaster: default_authority\nAverage rate: 116.621\nBuffer length: 5.042\nMost recent transform: 1764764614.879592\nOldest transform: 1764764609.837626\n"];
-"world" -> "Praktikum25_car3"[label=" Broadcaster: default_authority\nAverage rate: 116.622\nBuffer length: 5.042\nMost recent transform: 1764764614.879644\nOldest transform: 1764764609.837693\n"];
-"world" -> "Praktikum25_car4"[label=" Broadcaster: default_authority\nAverage rate: 116.621\nBuffer length: 5.042\nMost recent transform: 1764764614.879789\nOldest transform: 1764764609.837808\n"];
+"zed_left_camera_frame" -> "zed_imu_link"[label=" Broadcaster: default_authority\nAverage rate: 376.728\nBuffer length: 5.097\nMost recent transform: 1769261992.958236\nOldest transform: 1769261987.861722\n"];
+"zed_camera_center" -> "zed_left_camera_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"zed_camera_link" -> "base_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"map" -> "zed_camera_link"[label=" Broadcaster: default_authority\nAverage rate: 32.641\nBuffer length: 5.055\nMost recent transform: 1769261992.85112\nOldest transform: 1769261987.796146\n"];
 "base_link" -> "laser"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
-"world" -> "base_link"[label=" Broadcaster: default_authority\nAverage rate: 10.345\nBuffer length: 2.9\nMost recent transform: 1764764614.863816\nOldest transform: 1764764611.963887\n"];
-"world" -> "map"[label=" Broadcaster: default_authority\nAverage rate: 10.345\nBuffer length: 2.9\nMost recent transform: 1764764614.863869\nOldest transform: 1764764611.963933\n"];
+"zed_camera_link" -> "zed_camera_center"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"zed_left_camera_frame" -> "zed_left_camera_optical_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"zed_camera_center" -> "zed_right_camera_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"zed_right_camera_frame" -> "zed_right_camera_optical_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
 edge [style=invis];
  subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
-"Recorded at time: 1764764614.898159"[ shape=plaintext ] ;
-}->"world";
+"Recorded at time: 1769261992.9626045"[ shape=plaintext ] ;
+}->"map";
 }
