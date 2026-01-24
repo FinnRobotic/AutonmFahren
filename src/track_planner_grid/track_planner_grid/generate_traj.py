@@ -74,7 +74,7 @@ class TrackGraphFromGrid(Node):
 
         self.declare_parameter("save_csv", True)
 
-        self.declare_parameter("csv_out", "/home/finn/Desktop/AutonmFahren/src/track_planner_grid/track/trajectory.csv")
+        self.declare_parameter("csv_out", "/home/nvidia/theta_ws/src/track_planner_grid/track/trajectory.csv")
         self.declare_parameter("csv_stride", 1)
 
         # -------------------------
