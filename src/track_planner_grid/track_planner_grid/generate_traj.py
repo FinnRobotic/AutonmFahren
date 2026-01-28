@@ -57,8 +57,8 @@ class TrackGraphFromGrid(Node):
         # -------------------------
         # PARAMETERS
         # -------------------------
-        self.declare_parameter("pgm_file", "maps/track_map6.pgm")
-        self.declare_parameter("yaml_file", "maps/track_map6.yaml")
+        self.declare_parameter("pgm_file", "maps/track_map7.pgm")
+        self.declare_parameter("yaml_file", "maps/track_map7.yaml")
         self.declare_parameter("frame_id", "map")
 
         self.declare_parameter("track_is_free", True)

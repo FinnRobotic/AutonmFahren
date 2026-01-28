@@ -25,7 +25,7 @@ class TrajFullViz(Node):
 
         # ---------------- Params ----------------
         self.declare_parameter("csv_file", "/home/nvidia/theta_ws/src/track_planner_grid/track/trajectory.csv")
-        self.declare_parameter("yaml_file", "maps/track_map6.yaml")
+        self.declare_parameter("yaml_file", "maps/track_map7.yaml")
         self.declare_parameter("frame_id", "map")
         self.declare_parameter("z", 0.05)
         self.declare_parameter("rate", 1.0)

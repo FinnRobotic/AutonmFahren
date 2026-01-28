@@ -32,7 +32,7 @@ class PurePursuitPID(Node):
         # v_ref = clamp( sqrt(a_lat_max / |kappa|), v_ref_min, v_ref_max )
         self.declare_parameter("a_lat_max", 2.0)  # m/s^2
         self.declare_parameter("v_ref_min", 0.3)  # m/s
-        self.declare_parameter("v_ref_max", 3.3)  # m/s
+        self.declare_parameter("v_ref_max", 2.5)  # m/s
         self.declare_parameter("v_ref_smoothing_alpha", 0.1)  # 0..1
         self.declare_parameter("use_curvature_speed", True)
 
@@ -49,7 +49,7 @@ class PurePursuitPID(Node):
         self.declare_parameter('kd_steer', 0.0)
         self.declare_parameter('kp_psi_steer', 0.2)
         self.declare_parameter('pid_clip_deg', 10.0)
-        self.declare_parameter('steer_limit_deg', 30.0)
+        self.declare_parameter('steer_limit_deg', 40.0)
         self.declare_parameter('alpha', 0.2)
 
         self.declare_parameter('kp_speed', 0.0)
